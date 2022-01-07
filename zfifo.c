@@ -38,7 +38,7 @@ MODULE_DESCRIPTION("User space zero-copy AXI SG-DMA driver");
 MODULE_AUTHOR("osana");
 MODULE_LICENSE("Dual BSD/GPL");
 
-#define DRIVER_VERSION     "0.9.0"
+#define DRIVER_VERSION     "0.9.1"
 #define DRIVER_NAME        "zfifo"
 #define DEVICE_NAME_FORMAT "zfifo%d"
 #define DEVICE_MAX_NUM      256
@@ -158,7 +158,12 @@ static sg_mapping *alloc_sg_buf(zfifo_device_data* this,
   }
 
   // Pin pages
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5,8,0)
+  mmap_read_lock(current->mm);
+#else
   down_read(&current->mm->mmap_sem);
+#endif
+
   npages = get_user_pages(udata, npages_req,
                           ((dir==DMA_FROM_DEVICE) ? FOLL_WRITE : 0),
                           pages, NULL);
@@ -168,7 +173,12 @@ static sg_mapping *alloc_sg_buf(zfifo_device_data* this,
     kfree(sg_map);
     return NULL;
   }
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5,8,0)
+  mmap_read_unlock(current->mm);
+#else
   up_read(&current->mm->mmap_sem);
+#endif
 
   // Create scatterlist array
   if ((sgl = kcalloc(npages, sizeof(*sgl), GFP_KERNEL)) == NULL) {
@@ -833,8 +843,13 @@ static int zfifo_platform_driver_probe(struct platform_device *pdev){
     dev_err(&pdev->dev, "couldn't map AXI DMA registers.\n");
     goto failed;
   }
-  this->dma_regs = ioremap_nocache(dmac, dma_reg_size);
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5,6,0)
+  this->dma_regs = ioremap(dmac, dma_reg_size);
+#else
+  this->dma_regs = ioremap_nocache(dmac, dma_reg_size);
+#endif
+  
   printk("MM2S_DMASR: 0x%x\n", this->dma_regs[MM2S_DMASR]);
   printk("S2MM_DMASR: 0x%x\n", this->dma_regs[S2MM_DMASR]);
   zfifo_dmac_reset(this);
