@@ -1,5 +1,8 @@
 // zfifo: a Zero-copy AXI SG DMA driver for Zynq + Linux
 
+// Enable dev_dbg():
+// #define DEBUG 1
+
 #include <linux/cdev.h>
 #include <linux/clk.h>
 #include <linux/dma-mapping.h>
@@ -7,6 +10,8 @@
 #include <linux/idr.h>
 #include <linux/init.h>
 #include <linux/interrupt.h>
+#include <linux/irqdomain.h>
+#include <linux/irq.h>
 #include <linux/io.h>
 #include <linux/ioport.h>
 #include <linux/kernel.h>
@@ -38,7 +43,7 @@ MODULE_DESCRIPTION("User space zero-copy AXI SG-DMA driver");
 MODULE_AUTHOR("osana");
 MODULE_LICENSE("Dual BSD/GPL");
 
-#define DRIVER_VERSION     "0.9.1"
+#define DRIVER_VERSION     "0.9.2"
 #define DRIVER_NAME        "zfifo"
 #define DEVICE_NAME_FORMAT "zfifo%d"
 #define DEVICE_MAX_NUM      256
@@ -59,6 +64,7 @@ MODULE_LICENSE("Dual BSD/GPL");
 
 #define DMACR_RS      (1u<<0)
 #define DMACR_RESET   (1u<<2)
+#define DMACR_IOC_Irq (1u<<12)
 #define DMASR_HALTED  (1u<<0)
 #define DMASR_IDLE    (1u<<1)
 #define DMASR_IOC_Irq (1u<<12)
@@ -74,12 +80,10 @@ static const int dmac_buf_bits = 20;   // # bits of DMAC buffer counter
 #ifdef __aarch64__
 // ------------------------------
 #define HIGH32(x) ((x>>32) & 0xFFFFFFFF)
-static int dma_mask_bit = 64;
 // ------------------------------
 #else
 // ------------------------------
 #define HIGH32(x) (0)
-static int dma_mask_bit = 32;
 // ------------------------------
 #endif
 
@@ -100,6 +104,8 @@ typedef struct {
   unsigned      *tx_desc, *rx_desc;
   dma_addr_t     tx_phys, rx_phys;
   unsigned       dmac_buf_len;
+  unsigned       mm2s_irq, s2mm_irq;
+  wait_queue_head_t mm2s_waitq, s2mm_waitq;
 } zfifo_device_data;
 
 // ----------------------------------------------------------------------
@@ -167,6 +173,7 @@ static sg_mapping *alloc_sg_buf(zfifo_device_data* this,
   npages = get_user_pages(udata, npages_req,
                           ((dir==DMA_FROM_DEVICE) ? FOLL_WRITE : 0),
                           pages, NULL);
+
   if (npages <= 0){
     printk(KERN_ERR "zfifo: unable to pin any pages in memory\n");
     kfree(pages);
@@ -307,24 +314,33 @@ static int zfifo_recv(zfifo_device_data* this,
                       char __user *bufp, unsigned long len){
   sg_mapping *sg_map;
   dma_addr_t head, tail;
-
+  unsigned intr_en;
+  DEFINE_WAIT(wait);
+  
   sg_map = alloc_sg_buf(this, bufp, len, DMA_FROM_DEVICE,
                         this->rx_desc, this->rx_phys);
 
   head = this->rx_phys;
   tail = this->rx_phys + (0x40 * (sg_map->num_sg-1));
-
-
+  intr_en = (this->s2mm_irq != 0) ? DMACR_IOC_Irq : 0;
+  
   this->dma_regs[S2MM_CURDESC   ] = LOW32 (head);
   this->dma_regs[S2MM_CURDESC_H ] = HIGH32(head);
-  this->dma_regs[S2MM_DMACR     ] = DMACR_RS;
+  this->dma_regs[S2MM_DMACR     ] = DMACR_RS | intr_en;
   this->dma_regs[S2MM_TAILDESC  ] = LOW32 (tail);
   this->dma_regs[S2MM_TAILDESC_H] = HIGH32(tail);
 
+  
   dev_dbg(this->sys_dev,
           "Recv DMA regs=%pa user=%pa, len=%ld, head=%pad, tail=%pad\n",
           &this->dma_regs_phys, &bufp, len, &head, &tail);
 
+  if (this->s2mm_irq != 0){ // wait for interrupt if enabled
+    prepare_to_wait(&this->s2mm_waitq, &wait, TASK_INTERRUPTIBLE);
+    schedule(); // or maybe schedule_timeout()
+    finish_wait(&this->s2mm_waitq, &wait);
+  }
+  
   // wait 
   while( ~this->dma_regs[S2MM_DMASR] & DMASR_IOC_Irq ){};
   this->dma_regs[S2MM_DMASR] = (DMASR_IOC_Irq | DMASR_ERR_Irq);
@@ -340,17 +356,19 @@ static int zfifo_send(zfifo_device_data* this,
                       char __user *bufp, unsigned long len){
   sg_mapping *sg_map;
   dma_addr_t head, tail;
-
+  unsigned intr_en;
+  DEFINE_WAIT(wait);
+  
   sg_map = alloc_sg_buf(this, bufp, len, DMA_TO_DEVICE,
                         this->tx_desc, this->tx_phys);
 
   head = this->tx_phys;
   tail = this->tx_phys + (0x40 * (sg_map->num_sg-1));
-
+  intr_en = (this->mm2s_irq != 0) ? DMACR_IOC_Irq : 0;
 
   this->dma_regs[MM2S_CURDESC   ] = LOW32 (head);
   this->dma_regs[MM2S_CURDESC_H ] = HIGH32(head);
-  this->dma_regs[MM2S_DMACR     ] = DMACR_RS;
+  this->dma_regs[MM2S_DMACR     ] = DMACR_RS | intr_en;
   this->dma_regs[MM2S_TAILDESC  ] = LOW32 (tail);
   this->dma_regs[MM2S_TAILDESC_H] = HIGH32(tail);
 
@@ -358,13 +376,22 @@ static int zfifo_send(zfifo_device_data* this,
           "Send DMA regs=%pa user=%pa, len=%ld, head=%pad, tail=%pad\n",
           &this->dma_regs_phys, &bufp, len, &head, &tail);
   
+  if (this->mm2s_irq != 0){ // wait for interrupt if enabled
+    dev_dbg(this->sys_dev,
+            "MM2S intr mode: sleeping\n");
+    prepare_to_wait(&this->mm2s_waitq, &wait, TASK_INTERRUPTIBLE);
+    schedule(); // or maybe schedule_timeout()
+    dev_dbg(this->sys_dev,
+            "MM2S intr mode: good morning.\n");
+    finish_wait(&this->mm2s_waitq, &wait);
+  }
+
   // wait 
   while( ~this->dma_regs[MM2S_DMASR] & DMASR_IOC_Irq ){};
   this->dma_regs[MM2S_DMASR] = (DMASR_IOC_Irq | DMASR_ERR_Irq);
 
   // stop 
   this->dma_regs[MM2S_DMACR] = 0;
-
   
   free_sg_buf(sg_map);
   return 0;
@@ -559,21 +586,12 @@ zfifo_device_create(const char* name, struct device* parent, int minor){
 static int zfifo_device_setup(zfifo_device_data* this){
   unsigned tx_offset, rx_offset;
   void *tx, *rx;
-
+  unsigned int dma_mask_bit;
+  
   if (!this) return -ENODEV;
 
-  if (this->dma_dev->dma_mask == NULL)
-    this->dma_dev->dma_mask = &this->dma_dev->coherent_dma_mask;
-
-  if (*this->dma_dev->dma_mask == 0){
-    if (dma_set_mask(this->dma_dev, DMA_BIT_MASK(dma_mask_bit)) == 0) {
-      dma_set_coherent_mask(this->dma_dev, DMA_BIT_MASK(dma_mask_bit));
-    } else {
-      printk(KERN_WARNING "dma_set_mask(DMA_BIT_MASK(%d)) failed\n", dma_mask_bit);
-      dma_set_mask(this->dma_dev, DMA_BIT_MASK(32));
-      dma_set_coherent_mask(this->dma_dev, DMA_BIT_MASK(32));
-    }
-  }
+  dma_mask_bit = 8 * sizeof(dma_addr_t);
+  dma_set_mask_and_coherent(this->dma_dev, DMA_BIT_MASK(dma_mask_bit));
     
   this->tx_desc_base = dma_alloc_coherent(this->dma_dev,  desc_size,
                                           &this->tx_phys_base, GFP_KERNEL);
@@ -651,6 +669,7 @@ static int zfifo_device_destroy(zfifo_device_data* this){
 struct zfifo_static_device {
   struct platform_device* pdev;
   dma_addr_t             dmac;  // for 32bit ARM
+  unsigned  mm2s_irq, s2mm_irq;
 };
 
 struct zfifo_static_device zfifo_static_device_list[STATIC_DEVICE_NUM] = {};
@@ -658,11 +677,13 @@ struct zfifo_static_device zfifo_static_device_list[STATIC_DEVICE_NUM] = {};
 // ----------------------------------------------------------------------
 // Create & remove device
 
-static void zfifo_static_device_create(int id, dma_addr_t dmac){
+static void zfifo_static_device_create(int id, dma_addr_t dmac,
+                                       unsigned mm2s_irq, unsigned s2mm_irq){
   struct platform_device* pdev;
   int                     retval = 0;
 
-  printk("create %d %pa\n", id, &dmac);
+  printk("create %d regs@%pa mm2s IRQ %u s2mm IRQ %u\n",
+         id, &dmac, mm2s_irq, s2mm_irq);
     
   if ((id < 0) || (id >= STATIC_DEVICE_NUM))
     return;
@@ -670,10 +691,12 @@ static void zfifo_static_device_create(int id, dma_addr_t dmac){
   if (dmac == 0) {
     zfifo_static_device_list[id].pdev = NULL;
     zfifo_static_device_list[id].dmac = 0;
+    zfifo_static_device_list[id].mm2s_irq = 0;
+    zfifo_static_device_list[id].s2mm_irq = 0;
     return;
   }
 
-  printk("alloc\n");
+  printk("alloc id=%d\n", id);
   pdev = platform_device_alloc(DRIVER_NAME, id);
   if (IS_ERR_OR_NULL(pdev)) {
     retval = PTR_ERR(pdev);
@@ -690,6 +713,8 @@ static void zfifo_static_device_create(int id, dma_addr_t dmac){
 
   zfifo_static_device_list[id].pdev = pdev;
   zfifo_static_device_list[id].dmac = dmac;
+  zfifo_static_device_list[id].mm2s_irq = mm2s_irq;
+  zfifo_static_device_list[id].s2mm_irq = s2mm_irq;
   return;
 
  failed:
@@ -698,6 +723,8 @@ static void zfifo_static_device_create(int id, dma_addr_t dmac){
   }
   zfifo_static_device_list[id].pdev = NULL;
   zfifo_static_device_list[id].dmac = 0;
+  zfifo_static_device_list[id].mm2s_irq = 0;
+  zfifo_static_device_list[id].s2mm_irq = 0;
   return;
 }
 
@@ -716,7 +743,10 @@ static void zfifo_static_device_remove(int id){
 
 // Find in static device list
 static int zfifo_static_device_search(struct platform_device *pdev,
-                                      int* pid, unsigned int* pdmac){
+                                      int* pid,
+                                      unsigned int* pdmac,
+                                      unsigned int* mm2s_irq,
+                                      unsigned int* s2mm_irq){
   int id;
   int found = 0;
 
@@ -725,6 +755,8 @@ static int zfifo_static_device_search(struct platform_device *pdev,
         (zfifo_static_device_list[id].pdev == pdev)) {
       *pid   = id;
       *pdmac = zfifo_static_device_list[id].dmac;
+      *mm2s_irq = zfifo_static_device_list[id].mm2s_irq;
+      *s2mm_irq = zfifo_static_device_list[id].s2mm_irq;
       found  = 1;
       break;
     }
@@ -732,13 +764,19 @@ static int zfifo_static_device_search(struct platform_device *pdev,
   return found;
 }
 
-#define DEFINE_ZFIFO_STATIC_DEVICE_PARAM(__num)                         \
-  static int       zfifo ## __num = 0;                                  \
-  module_param(    zfifo ## __num, uint, S_IRUGO);                      \
-  MODULE_PARM_DESC(zfifo ## __num, DRIVER_NAME #__num " DMA regs");
+#define DEFINE_ZFIFO_STATIC_DEVICE_PARAM(__num)                      \
+  static unsigned long int zfifo ## __num = 0;                       \
+  module_param    (zfifo ## __num, ulong, S_IRUGO);                  \
+  MODULE_PARM_DESC(zfifo ## __num, DRIVER_NAME #__num " DMA regs");  \
+  static unsigned  mm2s ## __num = 0;                                \
+  module_param    (mm2s ## __num, uint, S_IRUGO);                    \
+  MODULE_PARM_DESC(mm2s ## __num, DRIVER_NAME #__num " MM2S IRQ");   \
+  static unsigned  s2mm ## __num = 0;                                \
+  module_param    (s2mm ## __num, uint, S_IRUGO);                    \
+  MODULE_PARM_DESC(s2mm ## __num, DRIVER_NAME #__num " S2MM IRQ");
 
 #define CALL_ZFIFO_STATIC_DEVICE_CREATE(__num)          \
-  zfifo_static_device_create(__num, zfifo ## __num);
+  zfifo_static_device_create(__num,  zfifo ## __num, mm2s ## __num, s2mm ## __num);
 
 DEFINE_ZFIFO_STATIC_DEVICE_PARAM(0);
 DEFINE_ZFIFO_STATIC_DEVICE_PARAM(1);
@@ -768,6 +806,21 @@ static void zfifo_static_device_remove_all(void){
 }
 
 // ----------------------------------------------------------------------
+// Interrupt handler
+
+irqreturn_t zfifo_intr(int irq, void *dev_id){
+  //   printk("zfifo: intr %d\n", irq);
+
+  zfifo_device_data *this;
+  this = (zfifo_device_data*)dev_id;
+
+  if (irq == this->mm2s_irq) wake_up(&this->mm2s_waitq);
+  if (irq == this->s2mm_irq) wake_up(&this->s2mm_waitq);
+  
+  return IRQ_HANDLED;
+}
+
+// ----------------------------------------------------------------------
 // Platform driver cleanup, probe and remove
 
 static int zfifo_platform_driver_cleanup(struct platform_device *pdev,
@@ -775,6 +828,14 @@ static int zfifo_platform_driver_cleanup(struct platform_device *pdev,
   int retval = 0;
 
   if (this != NULL) {
+    if (this->mm2s_irq != 0){
+      irq_dispose_mapping(this->mm2s_irq);
+      free_irq(this->mm2s_irq, NULL);
+    }
+    if (this->s2mm_irq != 0){
+      irq_dispose_mapping(this->s2mm_irq);
+      free_irq(this->s2mm_irq, NULL);
+    }
     retval = zfifo_device_destroy(this);
     dev_set_drvdata(&pdev->dev, NULL);
     of_reserved_mem_device_release(&pdev->dev);
@@ -790,14 +851,17 @@ static int zfifo_platform_driver_probe(struct platform_device *pdev){
   int                         retval       = 0;
   int                         of_status    = 0;
   unsigned int                of_u32_value = 0;
-  unsigned int                dmac         = 0;
+  unsigned int                dmac         = 0; // FIXME for 64bit
+  unsigned int                mm2s_irq     = 0;
+  unsigned int                s2mm_irq     = 0;
   int                         minor_number = -1;
   zfifo_device_data*          this         = NULL;
   const char*                 device_name  = NULL;
 
   dev_dbg(&pdev->dev, "driver probe start.\n");
 
-  if (zfifo_static_device_search(pdev, &minor_number, &dmac) == 0) {
+  if (zfifo_static_device_search(pdev, &minor_number,
+                                 &dmac, &mm2s_irq, &s2mm_irq) == 0) {
     /* 
     // still not 64bit compatible 
 
@@ -849,9 +913,10 @@ static int zfifo_platform_driver_probe(struct platform_device *pdev){
 #else
   this->dma_regs = ioremap_nocache(dmac, dma_reg_size);
 #endif
+
   
-  printk("MM2S_DMASR: 0x%x\n", this->dma_regs[MM2S_DMASR]);
-  printk("S2MM_DMASR: 0x%x\n", this->dma_regs[S2MM_DMASR]);
+  printk("MM2S_DMASR: 0x%x irq %u\n", this->dma_regs[MM2S_DMASR], mm2s_irq);
+  printk("S2MM_DMASR: 0x%x irq %u\n", this->dma_regs[S2MM_DMASR], s2mm_irq);
   zfifo_dmac_reset(this);
 
   // DMA setup
@@ -874,6 +939,61 @@ static int zfifo_platform_driver_probe(struct platform_device *pdev){
     dev_err(&pdev->dev, "driver setup failed. return=%d\n", retval);
     goto failed;
   }
+
+  // Find interrupt controller
+  if (mm2s_irq != 0 || s2mm_irq != 0){
+    struct device_node *dn;
+    struct irq_domain *dom;
+    struct irq_fwspec fws = {
+      .param_count = 3,
+      .param = {0, 0, 4}
+    };
+
+    dn = of_find_node_by_name(NULL, "interrupt-controller");
+    if (!dn){
+      printk(KERN_ERR "Could not find device node for GIC.\n");
+      goto failed;
+    }
+
+    dom = irq_find_host(dn);
+    if (!dom){
+      printk(KERN_ERR "Could not find IRQ domain for GIC.\n");
+      goto failed;
+    }
+    fws.fwnode = dom->fwnode;
+
+    // IRQ reg
+    if (mm2s_irq != 0){
+      fws.param[1] = mm2s_irq;
+      mm2s_irq = irq_create_fwspec_mapping(&fws);
+      
+      int result = request_irq(mm2s_irq, zfifo_intr,
+                               IRQF_SHARED|IRQF_TRIGGER_HIGH, KBUILD_MODNAME,
+                               this);
+      if (result<0){
+        printk(KERN_ERR "MM2S IRQ reg failed %d\n", result);
+        goto failed;
+      }
+      init_waitqueue_head(&this->mm2s_waitq);
+    }
+
+    if (s2mm_irq != 0){
+      fws.param[1] = s2mm_irq;
+      s2mm_irq = irq_create_fwspec_mapping(&fws);
+      
+      int result = request_irq(s2mm_irq, zfifo_intr,
+                               IRQF_SHARED|IRQF_TRIGGER_HIGH, KBUILD_MODNAME,
+                               this);
+      if (result<0){
+        printk(KERN_ERR "S2MM IRQ reg failed %d\n", result);
+        goto failed;
+      }
+      init_waitqueue_head(&this->s2mm_waitq);
+    }
+
+  }
+  this->mm2s_irq = mm2s_irq;
+  this->s2mm_irq = s2mm_irq;
     
   if (info_enable) {
     zfifo_device_info(this);
