@@ -1,0 +1,28 @@
+# Project specific
+libzfifo-test
+
+# Mac
+.DS_Store
+.AppleDouble
+._*
+
+# Emacs
+*~
+
+# Object files
+*.o
+*.so
+*.so.*
+*.elf
+*.dylib
+
+# Debug files
+*.dSYM
+
+# Linux kernel
+*.ko
+*.mod*
+modules.order
+Module.symvers
+Mkfile.old
+
