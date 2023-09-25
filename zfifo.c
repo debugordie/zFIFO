@@ -1,7 +1,8 @@
 // zfifo: a Zero-copy AXI SG DMA driver for Zynq + Linux
 
-// Enable dev_dbg():
-// #define DEBUG 1
+// #define DEBUG 1 is also required
+#define DEBUG 0
+// #define DEBUG_ZFIFO
 
 #include <linux/cdev.h>
 #include <linux/clk.h>
@@ -205,8 +206,8 @@ static sg_mapping *alloc_sg_buf(zfifo_device_data* this,
                 len_rem);
     sg_set_page(&sgl[i], pages[i], page_len, fp_offset);
 
-    //    printk("SG List [%d], offset 0x%x, page_len %d, %ld to go\n",
-    //            i, fp_offset, page_len, len_rem);
+    // printk("SG List [%d], offset 0x%x, page_len %d, %ld to go\n",
+    //        i, fp_offset, page_len, len_rem);
 
     len_rem -= page_len;
     fp_offset = 0; // no offset for 2nd and later pages
@@ -330,10 +331,11 @@ static int zfifo_recv(zfifo_device_data* this,
   this->dma_regs[S2MM_TAILDESC  ] = LOW32 (tail);
   this->dma_regs[S2MM_TAILDESC_H] = HIGH32(tail);
 
-  
+#ifdef DEBUG_ZFIFO  
   dev_dbg(this->sys_dev,
           "Recv DMA regs=%pa user=%pa, len=%ld, head=%pad, tail=%pad\n",
           &this->dma_regs_phys, &bufp, len, &head, &tail);
+#endif
 
   if (this->s2mm_irq != 0){ // wait for interrupt if enabled
     prepare_to_wait(&this->s2mm_waitq, &wait, TASK_INTERRUPTIBLE);
@@ -372,17 +374,23 @@ static int zfifo_send(zfifo_device_data* this,
   this->dma_regs[MM2S_TAILDESC  ] = LOW32 (tail);
   this->dma_regs[MM2S_TAILDESC_H] = HIGH32(tail);
 
+#ifdef DEBUG_ZFIFO
   dev_dbg(this->sys_dev,
           "Send DMA regs=%pa user=%pa, len=%ld, head=%pad, tail=%pad\n",
           &this->dma_regs_phys, &bufp, len, &head, &tail);
+#endif
   
   if (this->mm2s_irq != 0){ // wait for interrupt if enabled
+#ifdef DEBUG_ZFIFO
     dev_dbg(this->sys_dev,
             "MM2S intr mode: sleeping\n");
+#endif
     prepare_to_wait(&this->mm2s_waitq, &wait, TASK_INTERRUPTIBLE);
     schedule(); // or maybe schedule_timeout()
+#ifdef DEBUG_ZFIFO
     dev_dbg(this->sys_dev,
             "MM2S intr mode: good morning.\n");
+#endif
     finish_wait(&this->mm2s_waitq, &wait);
   }
 
@@ -417,7 +425,9 @@ static int zfifo_open(struct inode *inode, struct file *file){
   this = container_of(inode->i_cdev, zfifo_device_data, cdev);
   file->private_data = this;
   this->is_open = 1;
+#ifdef DEBUG_ZFIFO
   dev_dbg(this->sys_dev, "open: DMA regs at %pa\n", &this->dma_regs_phys);
+#endif
   
   return status;
 }
@@ -425,7 +435,9 @@ static int zfifo_open(struct inode *inode, struct file *file){
 static int zfifo_release(struct inode *inode, struct file *file){
   zfifo_device_data* this = file->private_data;
 
+#ifdef DEBUG_ZFIFO
   dev_dbg(this->sys_dev, "close: DMA regs at %pa\n", &this->dma_regs_phys);
+#endif
   this->is_open = 0;
 
   return 0;
@@ -858,7 +870,9 @@ static int zfifo_platform_driver_probe(struct platform_device *pdev){
   zfifo_device_data*          this         = NULL;
   const char*                 device_name  = NULL;
 
+#ifdef DEBUF_ZFIFO
   dev_dbg(&pdev->dev, "driver probe start.\n");
+#endif
 
   if (zfifo_static_device_search(pdev, &minor_number,
                                  &dmac, &mm2s_irq, &s2mm_irq) == 0) {
@@ -1013,13 +1027,17 @@ static int zfifo_platform_driver_remove(struct platform_device *pdev){
   zfifo_device_data* this   = dev_get_drvdata(&pdev->dev);
   int                         retval = 0;
 
+#ifdef DEBUG_ZFIFO
   dev_dbg(&pdev->dev, "driver remove start.\n");
+#endif
 
   retval = zfifo_platform_driver_cleanup(pdev, this);
 
+#ifdef DEBUG_ZFIFO
   if (info_enable) {
     dev_info(&pdev->dev, "driver removed.\n");
   }
+#endif
   return retval;
 }
 
