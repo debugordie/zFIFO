@@ -171,9 +171,14 @@ static sg_mapping *alloc_sg_buf(zfifo_device_data* this,
   down_read(&current->mm->mmap_sem);
 #endif
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6,5,0)
+  npages = get_user_pages(udata, npages_req,
+                          ((dir==DMA_FROM_DEVICE) ? FOLL_WRITE : 0), pages);
+#else 
   npages = get_user_pages(udata, npages_req,
                           ((dir==DMA_FROM_DEVICE) ? FOLL_WRITE : 0),
                           pages, NULL);
+#endif
 
   if (npages <= 0){
     printk(KERN_ERR "zfifo: unable to pin any pages in memory\n");
@@ -1090,7 +1095,11 @@ static int __init zfifo_module_init(void){
     goto failed;
   }
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6,4,0)
+  zfifo_sys_class = class_create(DRIVER_NAME);
+#else
   zfifo_sys_class = class_create(THIS_MODULE, DRIVER_NAME);
+#endif
   if (IS_ERR_OR_NULL(zfifo_sys_class)) {
     retval = PTR_ERR(zfifo_sys_class);
     zfifo_sys_class = NULL;
